@@ -29,14 +29,14 @@ import Data.Dynamic
 import Data.Word 
 import System.Environment (getArgs)
 import Control.Concurrent
+import Control.Concurrent.Async
+import Control.Monad
 
 globalLogQ :: TBMQueue B.ByteString
 globalLogQ = unsafePerformIO (newTBMQueueIO 400)
 {-# NOINLINE globalLogQ #-}
 
-startLoggingQueue file logq shutdownTMVar = do
-    mytid <- myThreadId
-    forkIO . flip catch (\e -> throwTo mytid (e::SomeException)) $ do
+startLoggingQueue file logq shutdownTMVar = async $ catch (do
         whileM_ (atomically . fmap not . isClosedTBMQueue $ logq) $ do
             done <- atomically $ tryReadTMVar shutdownTMVar
             case done of 
@@ -48,6 +48,7 @@ startLoggingQueue file logq shutdownTMVar = do
                         case x of
                             Just s -> B.appendFile file s
                             _ -> return ()
+    ) (\e -> appendFile file ("ERROR: " ++ show (e::SomeException) ++ "\n"))
     
 startLogging logfile = startLoggingQueue logfile globalLogQ globalShutdownLogging
 
@@ -124,24 +125,37 @@ globalShutdownLogging :: TMVar ()
 globalShutdownLogging = unsafePerformIO $ newEmptyTMVarIO
 {-# NOINLINE globalShutdownLogging #-}
 
-withGlobalLogging :: String -> (IO ()) -> IO ()
-withGlobalLogging postfix action = do
+withLog :: String -> (IO ()) -> IO ()
+withLog name action = do
     appName <- getProgName
     appDir <- getAppUserDataDirectory appName
     createDirectoryIfMissing True appDir
-    let logFile = (appDir </> appName ++ postfix)
-    catch (startLogging logFile>>action) handleExceptions >>= waitForLog
-    atomically $ putTMVar globalShutdownLogging ()
+    let logFile = case name of
+                    "" -> (appDir </> appName ++ ".log")
+                    _ -> (appDir </> appName ++ "." ++ name ++ ".log")
+    bracket 
+            (startLogging logFile) 
+            (\aid -> do
+                threadDelay 10000 -- time to print any exceptions
+                atomically $ closeTBMQueue globalLogQ
+                threadDelay 1000 -- give it a chance to shutdown itself
+                cancel aid       -- kill the thread
+            )
+            (\aid -> (do
+                --link aid
+                catch action logException
+                wait aid
+            ))
+                
+        
     where
         waitForLog x = do
             whileM (fmap not . atomically $ isEmptyTBMQueue globalLogQ) (threadDelay 5000)
             atomically $ closeTBMQueue globalLogQ
             return x
-        handleExceptions e = do
-            log (B.pack $ show (e::SomeException))
-            atomically $ putTMVar globalShutdownLogging ()
-            threadDelay 10000
-            atomically $ closeTBMQueue globalLogQ
+        logException e = do
+            log (B.pack $ "ERROR: " ++ show (e::SomeException) ++ "\n")
+            throw e
 
 -- | runPersonality 
 -- Entrypoint
@@ -149,7 +163,7 @@ withGlobalLogging postfix action = do
 -- argument is getArgs
 --
 runPersonality :: [String] -> IO ()
-runPersonality args = withGlobalLogging ".person.log" $ do
+runPersonality args = withLog "person" $ do
     print args
     let x = 2::Int
     logf " OK %s?" ("test"::String) 
