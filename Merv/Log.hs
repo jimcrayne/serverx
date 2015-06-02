@@ -1,4 +1,5 @@
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -23,6 +24,7 @@ import Control.Monad.Loops
 import Control.Exception
 
 import qualified Data.ByteString.Char8 as B
+import qualified Data.ByteString.Lazy as L
 import System.Environment (getProgName)
 import Data.Monoid
 
@@ -34,10 +36,47 @@ import Control.Concurrent
 import Control.Concurrent.Async
 import Control.Monad
 import Control.Monad.Fix
+import qualified Data.Map as M
+import Data.ByteString.Search (replace)
+import Data.List
 
-globalLogQ :: TBMQueue B.ByteString
+globalLogQ :: TBMQueue (ThreadId,B.ByteString)
 globalLogQ = unsafePerformIO (newTBMQueueIO 400)
 {-# NOINLINE globalLogQ #-}
+
+globalSearchReplace :: TVar (M.Map (ThreadId,B.ByteString) B.ByteString)
+globalSearchReplace = unsafePerformIO (newTVarIO (M.empty))
+{-# NOINLINE globalSearchReplace #-}
+
+equate :: B.ByteString -> B.ByteString -> IO Bool
+equate key@(B.uncons -> Just (k,ey)) val = do
+    tid <- myThreadId
+    let disallowed = ["$t","%t","%s", "%d"] 
+    if (k `elem` "%$") then 
+        if not (key `elem` disallowed) then do
+            atomically $ modifyTVar globalSearchReplace (M.insert (tid,key) val)
+            return True
+        else do
+            log' $ "ERROR (Logging):" 
+                <> B.pack (show tid) 
+                <> " Cannot change magic substitution keys: '" <> B.pack (show disallowed) 
+            return False
+    else do
+        log' $ "ERROR (Logging):" 
+            <> B.pack (show tid) 
+            <> " Failed to equate '" <> key <> "' and '" <> val <> "'. Must prefix '$' or '%'."
+        return False
+
+equate "" val  = do
+        tid <- myThreadId
+        log' $ "ERROR (Logging):" 
+            <> B.pack (show tid) 
+            <> " Cannot equate '" <> val <> "' to empty string."
+        return False
+
+log' s = do
+    tid <- myThreadId
+    atomically $ writeTBMQueue globalLogQ (tid,s)
 
 startLoggingQueue file logq shutdownTMVar = async . fix $ \loop -> (do
         whileM_ (atomically . fmap not . isClosedTBMQueue $ logq) $ do
@@ -49,21 +88,38 @@ startLoggingQueue file logq shutdownTMVar = async . fix $ \loop -> (do
                     whileM_ (atomically . fmap not $ isEmptyTBMQueue logq) $ do
                         x <- atomically $ readTBMQueue logq
                         case x of
-                            Just s -> B.appendFile file s
+                            Just (th,s) -> do
+                                equates <- atomically $ readTVar globalSearchReplace
+                                
+                                let kvs :: [(B.ByteString, B.ByteString)]
+                                    kvs = fmap (\((_,k),v) -> (k,v)) (M.toList equates)
+                                    kvs' = fmap (\(x,y) -> (L.fromChunks [x], L.fromChunks [y])) kvs
+                                    s' :: L.ByteString 
+                                    s' = foldl'
+                                            (\s (k,v) -> replace k v (B.concat $ L.toChunks s))
+                                            (L.fromChunks [s])
+                                            kvs
+                                B.appendFile file (B.concat $ L.toChunks s')
                             _ -> return ()
     ) `catches` [ Handler (\(e:: IOException) -> appendFile file ("ERROR (Logging): " ++ show (e) ++ "\n"))
-                , Handler (\(e:: FormatError) -> do 
-                                appendFile file ("ERROR (Logging): " ++ show (e) ++ "\n") 
+                , Handler (\(FormatError st s:: FormatError) -> do 
+                                case st of
+                                    _ -> appendFile file ("ERROR (Logging): " ++ s ++ "\n") 
                                 loop
                           )]
 
-data FormatError = FormatError String deriving (Show,Typeable)
+data FormatError = FormatError (Maybe FormatState) String deriving (Show,Typeable)
 instance Exception FormatError
     
 startLogging logfile = startLoggingQueue logfile globalLogQ globalShutdownLogging
 
 log :: B.ByteString -> IO ()
-log s = atomically $ writeTBMQueue globalLogQ (s <> "\n")
+log s = do
+    tid <- myThreadId
+    let t = B.pack $ show tid
+    atomically $ modifyTVar globalSearchReplace (M.insert (tid,"%t") t)
+    atomically $ modifyTVar globalSearchReplace (M.insert (tid,"$t") t)
+    atomically $ writeTBMQueue globalLogQ (tid,(s <> "\n"))
 
 -- logf s = atomically . writeTBMQueue globalLogQ . B.pack . printf (s <> "\n")
 
@@ -93,45 +149,56 @@ mkFormatTag x =
 --    mkFormatTag = FmtInteger
 
 class LogFType t where
-    logfTags ::  String -> [FormatTag] -> t
+    logfTags ::  Maybe FormatState -> String -> [FormatTag] -> t
 
 instance LogFType String where
-    logfTags formatstr args = uprintf formatstr (reverse args)
+    logfTags st formatstr args = uprintf st formatstr (reverse args)
 
-uprintf :: String -> [FormatTag] -> String
-uprintf ""         []     = ""
-uprintf ""         _      = fmterror
-uprintf ('%':_:_ ) []     = argerror
-uprintf ('%':c:cs) (u:us) = fmt c u ++ uprintf cs us
-uprintf ( c :cs   ) us    = c : uprintf cs us
+data FormatState = FState { threadId :: ThreadId } deriving (Show,Typeable)
 
-fmt :: Char -> FormatTag -> String
-fmt 'd' u = asint u
-fmt 's' u = asstr u
+uprintf :: Maybe FormatState -> String -> [FormatTag] -> String
+uprintf fs ""         []     = ""
+uprintf fs ""         _      = fmterror fs
+--uprintf fs ('%':'t':c:cs) us = fmt fs c (error "Report Bug in Log.hs!") ++ uprintf fs cs us
+uprintf fs ('%':_:_ ) []     = argerror fs
+uprintf fs ('%':c:cs) (u:us) = fmt fs c u ++ uprintf fs cs us
+uprintf fs ( c :cs   ) us    = c : uprintf fs cs us
 
-asint (FmtInteger i x) = x
-asint (FmtString  _ _) = typeerror "Integral" "String"
+fmt :: Maybe FormatState ->  Char -> FormatTag -> String
+fmt fs 'd' u = asint fs u
+fmt fs 's' u = asstr fs u
+--fmt fs 't' _ = case fs of
+--                    (Just (FState tid)) -> show tid
+--                    _ -> "%t-id"
 
-asstr :: FormatTag -> String
-asstr (FmtString  s x) = fromDyn x ""
-asstr (FmtInteger _ x) = x -- typeerror "String" "Integral"
+asint _ (FmtInteger i x) = x
+asint fs (FmtString  _ _) = typeerror fs "Integral" "String"
 
-typeerror t1 t2 = errorFmt $ "Type error: expected " ++ t1 ++ ", got " ++ t2 ++ "."
+asstr :: Maybe FormatState -> FormatTag -> String
+asstr _ (FmtString  s x) = fromDyn x ""
+asstr _ (FmtInteger _ x) = x -- typeerror "String" "Integral"
 
-fmterror = errorFmt "Reached end of format string with args remaining."
-argerror = errorFmt "Insufficient args for format string"
+typeerror fs t1 t2 = errorFmt fs $ "Type error: expected " ++ t1 ++ ", got " ++ t2 ++ "."
 
-errorFmt s= throw (FormatError s)
+fmterror fs = errorFmt fs "Reached end of format string with args remaining."
+argerror fs = errorFmt fs "Insufficient args for format string"
+
+errorFmt fs s= throw (FormatError fs s)
 
 instance LogFType (IO a) where
-    logfTags formatstr args = catch (log (B.pack $ uprintf formatstr (reverse args)) >> return undefined)
-                                    (\e -> log (B.pack (show (e::SomeException))) >> return undefined)
+    logfTags state formatstr args = case state of
+        Nothing -> do
+            log (B.pack $ uprintf Nothing formatstr (reverse args)) 
+            return undefined
+        ms -> do
+            log (B.pack $ uprintf ms formatstr (reverse args)) 
+            return undefined
 
 instance (Typeable a, Show a, LogFType t) => LogFType (a -> t) where
-    logfTags fmt args a = logfTags fmt (mkFormatTag a : args)
+    logfTags state fmt args a = logfTags state fmt (mkFormatTag a : args)
 
 logf :: LogFType r => String -> r
-logf fmtstr = logfTags fmtstr []
+logf fmtstr = logfTags Nothing fmtstr []
 
 globalShutdownLogging :: TMVar ()
 globalShutdownLogging = unsafePerformIO $ newEmptyTMVarIO
