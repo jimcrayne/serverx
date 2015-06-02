@@ -3,6 +3,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 module Merv.Log where
     
 import Prelude hiding (log)
@@ -31,12 +33,13 @@ import System.Environment (getArgs)
 import Control.Concurrent
 import Control.Concurrent.Async
 import Control.Monad
+import Control.Monad.Fix
 
 globalLogQ :: TBMQueue B.ByteString
 globalLogQ = unsafePerformIO (newTBMQueueIO 400)
 {-# NOINLINE globalLogQ #-}
 
-startLoggingQueue file logq shutdownTMVar = async $ catch (do
+startLoggingQueue file logq shutdownTMVar = async . fix $ \loop -> (do
         whileM_ (atomically . fmap not . isClosedTBMQueue $ logq) $ do
             done <- atomically $ tryReadTMVar shutdownTMVar
             case done of 
@@ -48,7 +51,14 @@ startLoggingQueue file logq shutdownTMVar = async $ catch (do
                         case x of
                             Just s -> B.appendFile file s
                             _ -> return ()
-    ) (\e -> appendFile file ("ERROR: " ++ show (e::SomeException) ++ "\n"))
+    ) `catches` [ Handler (\(e:: IOException) -> appendFile file ("ERROR (Logging): " ++ show (e) ++ "\n"))
+                , Handler (\(e:: FormatError) -> do 
+                                appendFile file ("ERROR (Logging): " ++ show (e) ++ "\n") 
+                                loop
+                          )]
+
+data FormatError = FormatError String deriving (Show,Typeable)
+instance Exception FormatError
     
 startLogging logfile = startLoggingQueue logfile globalLogQ globalShutdownLogging
 
@@ -106,10 +116,12 @@ asstr :: FormatTag -> String
 asstr (FmtString  s x) = fromDyn x ""
 asstr (FmtInteger _ x) = x -- typeerror "String" "Integral"
 
-typeerror t1 t2 = error $ "Type error: expected " ++ t1 ++ ", got " ++ t2 ++ "."
+typeerror t1 t2 = errorFmt $ "Type error: expected " ++ t1 ++ ", got " ++ t2 ++ "."
 
-fmterror = error "Reached end of format string with args remaining."
-argerror = error "Insufficient args for format string"
+fmterror = errorFmt "Reached end of format string with args remaining."
+argerror = errorFmt "Insufficient args for format string"
+
+errorFmt s= throw (FormatError s)
 
 instance LogFType (IO a) where
     logfTags formatstr args = catch (log (B.pack $ uprintf formatstr (reverse args)) >> return undefined)
@@ -142,9 +154,7 @@ withLog name action = do
                 cancel aid       -- kill the thread
             )
             (\aid -> (do
-                --link aid
                 catch action logException
-                wait aid
             ))
                 
         
