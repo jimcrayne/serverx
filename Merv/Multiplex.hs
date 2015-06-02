@@ -5,56 +5,67 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE BangPatterns #-}
-module Merv.Types where
+module Merv.Multiplex where
 
-import Network
 import System.IO
 import qualified Data.ByteString.Char8 as B
-import Data.ByteString.Internal (ByteString (..) )
-import Network.IRC
-import Network.IRC.Base
-import System.Exit
-import System.Directory
-import System.FilePath
 import Data.Monoid
 import Control.Concurrent.STM
 import Data.Map.Strict as M
 import Control.Monad
 import Control.Concurrent
-import qualified Data.Set as S
-import Control.Arrow (second,first)
-import System.Environment hiding (getExecutablePath)
-import System.Environment.Executable (getExecutablePath)
-import System.Process
-import Numeric (readDec)
-import Network.Socket.Internal (PortNumber (..))
 import qualified Data.Binary as Bin
-import Data.Binary.Get.Internal as X
-import Data.Binary.Put as Y
-import GHC.Generics (Generic)
 import Control.Concurrent.STM.TBMQueue
 import Control.Monad.Loops
 import Data.List
 import Data.Maybe
 
--- | multiplexChildPost
+-- | pipeTransHookMicroseconds
 --
---  This function indefinitely reads the @childout@ queue and applies 
+--  This function indefinitely reads the @fromChan@ queue and applies 
 --  the function @translate@ to the contents before passing it on to the
---  @out@ queue. The @triggerAction@ is performed on the message prior
---  to translation.
+--  @toChan@ queue. The @triggerAction@ is performed on the message prior
+--  to the translation. The @fromChan@ queue is checked every @micros@ 
+--  microseconds from the last emptying.
 --
---  To terminate the thread, close @childout@ queue.
+--  To terminate the thread, close @fromChan@ queue.
 --
-multiplexChildPost :: TBMQueue Message -> TBMQueue Message -> (Message -> Maybe Message) -> (Message -> IO ())-> IO ()
-multiplexChildPost out childout translate triggerAction = whileM_ (fmap not (atomically $ isClosedTBMQueue childout)) $ do
-    whileM_ (fmap not (atomically $ isEmptyTBMQueue childout)) $ do
-        msg <- atomically $ readTBMQueue childout
-        case msg of
-            Just m' -> do
-                triggerAction m'
-                case translate m' of
-                    Just m -> atomically $ writeTBMQueue out m
-                    _ -> return ()
-            _ -> return ()
-    threadDelay 5000 -- yield two 100ths of a second, for other threads
+pipeTransHookMicroseconds :: TBMQueue a -> TBMQueue b -> Int ->  (a -> Maybe b) -> (a -> IO ()) -> IO ()
+pipeTransHookMicroseconds fromChan toChan micros translate triggerAction = 
+    whileM_ (fmap not (atomically $ isClosedTBMQueue fromChan)) $ do
+        whileM_ (fmap not (atomically $ isEmptyTBMQueue fromChan)) $ do
+            msg <- atomically $ readTBMQueue fromChan
+            case msg of
+                Just m' -> do
+                    triggerAction m'
+                    case translate m' of
+                        Just m -> atomically $ writeTBMQueue toChan m
+                        _ -> return ()
+                _ -> return ()
+        threadDelay micros -- 5000 -- yield two 100ths of a second, for other threads
+
+pipeTransHook fromChan toChan translate triggerAction =
+    pipeTransHookMicroseconds fromChan toChan 5000 translate triggerAction 
+
+pipeTrans fromChan toChan translate = 
+    pipeTransHook fromChan toChan translate (void . return)
+
+pipeHook fromChan toChan triggerAction = 
+    pipeTransHook fromChan toChan id triggerAction
+
+pipeQueue fromChan toChan =
+    pipeTransHookMicroseconds fromChan toChan 5000 id (void . return) 
+
+teePipeQueueMicroseconds fromChan toChan1 toChan2 micros =
+    whileM_ (fmap not (atomically $ isClosedTBMQueue fromChan)) $ do
+        whileM_ (fmap not (atomically $ isEmptyTBMQueue fromChan)) $ do
+            msg <- atomically $ readTBMQueue fromChan
+            case msg of
+                Just m -> do
+                    atomically $ writeTBMQueue toChan1 m
+                    atomically $ writeTBMQueue toChan2 m
+                _ -> return ()
+        threadDelay micros -- 5000 -- yield two 100ths of a second, for other threads
+
+teePipeQueue fromChan toChan1 toChan2 =
+    teePipeQueueMicroseconds fromChan toChan1 toChan2 5000 
