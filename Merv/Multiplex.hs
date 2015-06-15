@@ -30,15 +30,15 @@ import Data.Maybe
 --
 --  To terminate the thread, close @fromChan@ queue.
 --
-pipeTransHookMicroseconds :: TBMQueue a -> TBMQueue b -> Int ->  (a -> Maybe b) -> (a -> IO ()) -> IO ()
+pipeTransHookMicroseconds :: TBMQueue a -> TBMQueue b -> Int ->  (x -> a -> Maybe b) -> (a -> IO x) -> IO ()
 pipeTransHookMicroseconds fromChan toChan micros translate triggerAction = 
     whileM_ (fmap not (atomically $ isClosedTBMQueue fromChan)) $ do
         whileM_ (fmap not (atomically $ isEmptyTBMQueue fromChan)) $ do
             msg <- atomically $ readTBMQueue fromChan
             case msg of
                 Just m' -> do
-                    triggerAction m'
-                    case translate m' of
+                    x <- triggerAction m'
+                    case translate x m' of
                         Just m -> atomically $ writeTBMQueue toChan m
                         _ -> return ()
                 _ -> return ()
@@ -54,7 +54,7 @@ pipeHook fromChan toChan triggerAction =
     pipeTransHook fromChan toChan id triggerAction
 
 pipeQueue fromChan toChan =
-    pipeTransHookMicroseconds fromChan toChan 5000 id (void . return) 
+    pipeTransHookMicroseconds fromChan toChan 5000 (\() -> Just) (void . return) 
 
 teePipeQueueMicroseconds fromChan toChan1 toChan2 micros =
     whileM_ (fmap not (atomically $ isClosedTBMQueue fromChan)) $ do
@@ -69,3 +69,13 @@ teePipeQueueMicroseconds fromChan toChan1 toChan2 micros =
 
 teePipeQueue fromChan toChan1 toChan2 =
     teePipeQueueMicroseconds fromChan toChan1 toChan2 5000 
+
+
+withQueueMicroseconds fromChan action delay = whileM_ (atomically . fmap not $ isClosedTBMQueue fromChan) $ do
+    whileM_ (atomically . fmap not $ isEmptyTBMQueue fromChan) $ do
+        t <- atomically $ readTBMQueue fromChan
+        case t of 
+            Just x -> action x
+            Nothing -> return ()
+    threadDelay delay
+withQueue fromchan action = withQueueMicroseconds fromchan action 5000
