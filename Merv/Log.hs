@@ -50,6 +50,12 @@ globalShutdownLogging :: TMVar ()
 globalShutdownLogging = unsafePerformIO newEmptyTMVarIO
 {-# NOINLINE globalShutdownLogging #-}
 
+globalEchoFlag :: TVar Bool
+globalEchoFlag = unsafePerformIO (newTVarIO False)
+{-# NOINLINE globalEchoFlag #-}
+enableEcho = atomically $ writeTVar globalEchoFlag True
+disableEcho = atomically $ writeTVar globalEchoFlag False
+
 equate :: B.ByteString -> B.ByteString -> IO Bool
 equate key@(B.uncons -> Just (k,ey)) val = do
     tid <- myThreadId
@@ -102,7 +108,10 @@ startLoggingQueue file logq shutdownTMVar = async . fix $ \loop -> (
                                             (\s (k,v) -> replace k v (B.concat $ L.toChunks s))
                                             (L.fromChunks [s])
                                             kvs
-                                B.appendFile file (B.concat $ L.toChunks s')
+                                let outline = B.concat $ L.toChunks s'
+                                B.appendFile file outline
+                                bEcho <- atomically $ readTVar globalEchoFlag
+                                if bEcho then B.putStrLn outline else return ()
                             _ -> return ()
     ) `catches` [ Handler (\(e:: IOException) -> appendFile file ("ERROR (Logging): " ++ show e ++ "\n"))
                 , Handler (\(FormatError st s:: FormatError) -> do 
@@ -178,7 +187,7 @@ asint _ (FmtInteger i x) = x
 asint fs (FmtString  _ _) = typeerror fs "Integral" "String"
 
 asstr :: Maybe FormatState -> FormatTag -> String
-asstr _ (FmtString  s x) = fromDyn x ""
+asstr _ (FmtString  s x) = fromDyn x "<ERROR:ByteString Bug TODO>"
 asstr _ (FmtInteger _ x) = x -- typeerror "String" "Integral"
 
 typeerror fs t1 t2 = errorFmt fs $ "Type error: expected " ++ t1 ++ ", got " ++ t2 ++ "."
