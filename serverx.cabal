@@ -44,7 +44,6 @@ library
                        stm-chans >= 2.0.0,
                        monad-loops -any,
                        HTTP -any,
-                       tostring -any,
                        async >= 2.0.0,
                        stringsearch >= 0.3.0,
                        cereal -any,
@@ -54,7 +53,7 @@ executable serverx
   main-is:             Main.hs
   -- other-modules:       
   -- other-extensions:    
-  buildable:           False
+  buildable:           True
   build-depends:       base >=4.7 && <4.8,
 
                        network >= 2.4 && < 3.0, 
@@ -78,7 +77,6 @@ executable serverx
                        stm-chans >= 2.0.0,
                        monad-loops -any,
                        HTTP -any,
-                       tostring -any,
                        async >= 2.0.0,
                        stringsearch >= 0.3.0,
                        cereal -any

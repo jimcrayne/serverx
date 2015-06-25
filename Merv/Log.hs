@@ -58,8 +58,8 @@ globalLogHandleRegistry :: TVar (M.Map B.ByteString LogHandle)
 globalLogHandleRegistry = unsafePerformIO $ newTVarIO M.empty
 {-# NOINLINE globalLogHandleRegistry #-}
 
-quickNameToFileName :: String -> IO String
-quickNameToFileName name = do
+getDefaultLogFileName :: String -> IO String
+getDefaultLogFileName name = do
     appName <- getProgName
     bVarLog <- canWriteToVarLog
     logDir <- 
@@ -72,7 +72,7 @@ quickNameToFileName name = do
                     _ ->  logDir </> appName ++ "." ++ name ++ extSeparator:"log"
 
 newLog :: String -> IO LogHandle
-newLog name = quickNameToFileName name >>= newLogWithFile
+newLog name = getDefaultLogFileName name >>= newLogWithFile
 
 newLogWithFile logFile = do
     handlesMap <- atomically $ readTVar globalLogHandleRegistry
@@ -86,6 +86,11 @@ newLogWithFile logFile = do
             echoFlag <- newTVarIO False
             mutex <- newTMVarIO ()
             managers <- newTVarIO [] :: IO (TVar [ThreadId])
+            let dir = takeDirectory logFile
+            createDirectoryIfMissing True dir
+            fileExists <- doesFileExist logFile
+            unless fileExists (openFile logFile WriteMode >>= hClose)
+                              
             let h =LogH { logQ = q
                         , logFileName = logFile
                         , logPrefix = prefix
@@ -97,14 +102,6 @@ newLogWithFile logFile = do
             atomically $ modifyTVar globalLogHandleRegistry (M.insert (B.pack logFile) h)
             return h
 
-{-
-withLog :: String -> IO () -> IO ()
-withLog name action = do
-    appName <- getProgName
-    appDir <- getAppUserDataDirectory appName
-    createDirectoryIfMissing True appDir
-
--}
 enableEcho lh = atomically $ writeTVar (logEchoFlag lh) True
 disableEcho lh = atomically $ writeTVar (logEchoFlag lh) False
 
@@ -329,3 +326,5 @@ logException :: LogHandle -> SomeException -> IO a
 logException lh e = do
     log lh (B.pack $ "ERROR: " ++ show (e::SomeException) ++ "\n")
     throw e
+
+logToFile filename str = withLogFile filename (\lh -> log lh str)

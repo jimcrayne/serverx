@@ -2,7 +2,7 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 import Prelude hiding (log)
-import Merv.Log
+import qualified Merv.Log as Log
 import Merv.Multiplex
 
 import System.Environment
@@ -16,28 +16,53 @@ import Control.Concurrent.STM.TBMQueue
 import Control.Concurrent.STM
 import Control.Concurrent
 import Control.Monad
+import Control.Monad.Loops
 
 import Merv.PortServer
 import Control.Concurrent.Async
 import Data.Monoid
 import System.IO.Temp
 
-main = withLog "" $ do
+main = Log.withLog "" $ \lh -> do
+    let log = Log.log lh . B.pack
+    Log.enableEcho lh
     newchans <- atomically $ newTBMQueue 20 :: IO (TBMQueue (ThreadId, TBMQueue IRC.Message))
     outq <- atomically $ newTBMQueue 20 :: IO (TBMQueue IRC.Message)
     connections <- atomically $ newTVar M.empty :: IO (TVar (M.Map ThreadId (TBMQueue IRC.Message)))
+    log "Listening on port 4444..."
     listenAsync <- async $ createIRCPortListener 4444 "<SERVER-NAME>" 5000 20 20 newchans outq 
-    newchanAsync <- async $ withQueue newchans (runNewClientConnection connections)
+    newchanAsync <- async $ consumeQueueMicroseconds newchans 5000 (runNewClientConnection outq connections)
+    broadcaster <- async $ consumeQueueMicroseconds outq 5000 (broadcast connections)
     
-    void $ waitBoth listenAsync newchanAsync
+    void $ waitAny [listenAsync,newchanAsync,broadcaster]
     
     
-runNewClientConnection :: TVar (M.Map ThreadId (TBMQueue IRC.Message)) -> (ThreadId,TBMQueue IRC.Message) -> IO ()
-runNewClientConnection connmap (tid,chan) = do
+runNewClientConnection :: TBMQueue IRC.Message
+                       -> TVar (M.Map ThreadId (TBMQueue IRC.Message)) 
+                       -> (ThreadId,TBMQueue IRC.Message) -> IO ()
+
+runNewClientConnection outq connmap (tid,chan) = Log.withLog "" $ \lh -> do
     print (tid,"hello"::String)
-    mp <- atomically $ do
-        modifyTVar connmap (M.insert tid chan)
-        readTVar connmap
+    (mp,closed) <- atomically $ do
+        mp'unfiltered <- readTVar connmap
+        closedKVals <- filterM (isClosedTBMQueue . snd) (M.toList mp'unfiltered)
+        modifyTVar connmap (M.filterWithKey (\k v -> not (k `elem` map fst closedKVals)))
+        mp <- readTVar connmap
+        return (mp,map fst closedKVals)
+    let name = B.pack (show tid)
+        welcomeMessage = ("Welcome!! New Connection: You are " <> name)
+    Log.log lh ("-> (" <> B.pack (show tid) <> ") " <> welcomeMessage)
+    atomically $ writeTBMQueue chan (IRC.privmsg "" welcomeMessage)
     let l = M.toList mp
-    mapM_ (\(i,c) -> atomically $ writeTBMQueue c (IRC.privmsg "" ("hello " <> B.pack (show i)))) l
-    return ()
+    forM_ l $ \(i,c) -> do
+        atomically $ writeTBMQueue outq (IRC.privmsg "" ("* " <> name <> " enters."))
+        forM_ closed $ \closedTid ->  
+            atomically $ writeTBMQueue outq (IRC.privmsg "" ("* " <>B.pack (show closedTid) <> " exits."))
+         
+    atomically $ modifyTVar connmap (M.insert tid chan)
+
+broadcast connections msg =  Log.withLog "" $ \lh -> do
+    mp <- atomically $ readTVar connections
+    forM_ (M.elems mp) $ \q -> do
+        Log.log lh (" > (All conns) " <> IRC.encode msg)
+        atomically $ writeTBMQueue q msg
