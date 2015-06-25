@@ -20,6 +20,7 @@ import Control.Monad
 import Merv.PortServer
 import Control.Concurrent.Async
 import Data.Monoid
+import System.IO.Temp
 
 main = withLog "" $ do
     newchans <- atomically $ newTBMQueue 20 :: IO (TBMQueue (ThreadId, TBMQueue IRC.Message))
@@ -27,6 +28,7 @@ main = withLog "" $ do
     connections <- atomically $ newTVar M.empty :: IO (TVar (M.Map ThreadId (TBMQueue IRC.Message)))
     listenAsync <- async $ createIRCPortListener 4444 "<SERVER-NAME>" 5000 20 20 newchans outq 
     newchanAsync <- async $ withQueue newchans (runNewClientConnection connections)
+    
     void $ waitBoth listenAsync newchanAsync
     
     

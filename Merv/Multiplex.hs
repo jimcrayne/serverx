@@ -71,6 +71,8 @@ teePipeQueue fromChan toChan1 toChan2 =
     teePipeQueueMicroseconds fromChan toChan1 toChan2 5000 
 
 
+-- Deprecated: Use consumeQueueMicroseconds
+-- TODO: Remove this
 withQueueMicroseconds fromChan action delay = whileM_ (atomically . fmap not $ isClosedTBMQueue fromChan) $ do
     whileM_ (atomically . fmap not $ isEmptyTBMQueue fromChan) $ do
         t <- atomically $ readTBMQueue fromChan
@@ -78,4 +80,21 @@ withQueueMicroseconds fromChan action delay = whileM_ (atomically . fmap not $ i
             Just x -> action x
             Nothing -> return ()
     threadDelay delay
-withQueue fromchan action = withQueueMicroseconds fromchan action 5000
+
+{-# ANN withQueue ("HLint: Ignore Eta reduce"::String) #-}
+withQueue fromchan action = consumeQueueMicroseconds fromchan 5000 action 
+{-# DEPRECATED withQueueMicroseconds, withQueue "Use consumeQueueMicroseconds" #-}
+
+-- | consumeQueueMicroseconds
+-- (as of version 1.0.4)
+--
+-- Continously run the provided action on items
+-- from the provided queue. Delay for provided
+-- microseconds each time the queue is emptied.
+consumeQueueMicroseconds q micros action = whileM_ (atomically . fmap not $ isClosedTBMQueue q) $ do
+    whileM_ (atomically . fmap not $ isEmptyTBMQueue q) $ do
+        x <- atomically $ readTBMQueue q
+        case x of
+            Just s -> action s
+            Nothing -> return ()
+    threadDelay micros

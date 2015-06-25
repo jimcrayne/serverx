@@ -37,101 +37,172 @@ import Control.Monad.Fix
 import qualified Data.Map as M
 import Data.ByteString.Search (replace)
 import Data.List
+import CanWriteToVarLog
+import System.FilePath
 
-globalLogQ :: TBMQueue (ThreadId,B.ByteString)
-globalLogQ = unsafePerformIO (newTBMQueueIO 400)
-{-# NOINLINE globalLogQ #-}
+type LogQueue = TBMQueue (ThreadId, B.ByteString)
 
-globalLogReplaceMap :: TVar (M.Map (ThreadId,B.ByteString) B.ByteString)
-globalLogReplaceMap = unsafePerformIO (newTVarIO M.empty)
-{-# NOINLINE globalLogReplaceMap #-}
+data LogHandle = LogH { logQ :: LogQueue
+                      , logFileName :: FilePath
+                      , logPrefix :: TVar B.ByteString
+                      , logReplaceMap :: TVar (M.Map (ThreadId,B.ByteString) B.ByteString)
+                      , logEchoFlag :: TVar Bool
+                      , logFileMutex :: TMVar () -- Not strictly necessary anymore, now that I have
+                                                 -- an active logManagers list... But I'll leave it
+                                                 -- just in case someone wants to write to the file
+                                                 -- from some non logManager thread.
+                      , logManagers :: TVar [ThreadId]
+                      }
 
-globalShutdownLogging :: TMVar ()
-globalShutdownLogging = unsafePerformIO newEmptyTMVarIO
-{-# NOINLINE globalShutdownLogging #-}
+globalLogHandleRegistry :: TVar (M.Map B.ByteString LogHandle)
+globalLogHandleRegistry = unsafePerformIO $ newTVarIO M.empty
+{-# NOINLINE globalLogHandleRegistry #-}
 
-globalEchoFlag :: TVar Bool
-globalEchoFlag = unsafePerformIO (newTVarIO False)
-{-# NOINLINE globalEchoFlag #-}
-enableEcho = atomically $ writeTVar globalEchoFlag True
-disableEcho = atomically $ writeTVar globalEchoFlag False
+quickNameToFileName :: String -> IO String
+quickNameToFileName name = do
+    appName <- getProgName
+    bVarLog <- canWriteToVarLog
+    logDir <- 
+        if bVarLog then
+            return "/var/log"
+        else
+            getAppUserDataDirectory appName
+    return $ case name of
+                    "" -> logDir </> appName ++ extSeparator:"log"
+                    _ ->  logDir </> appName ++ "." ++ name ++ extSeparator:"log"
 
-equate :: B.ByteString -> B.ByteString -> IO Bool
-equate key@(B.uncons -> Just (k,ey)) val = do
+newLog :: String -> IO LogHandle
+newLog name = quickNameToFileName name >>= newLogWithFile
+
+newLogWithFile logFile = do
+    handlesMap <- atomically $ readTVar globalLogHandleRegistry
+    case M.lookup (B.pack logFile) handlesMap of
+        Just h -> return h
+
+        Nothing -> do
+            q <- newTBMQueueIO 200 :: IO LogQueue
+            replaceMap <- newTVarIO M.empty
+            prefix <- newTVarIO (B.pack "")
+            echoFlag <- newTVarIO False
+            mutex <- newTMVarIO ()
+            managers <- newTVarIO [] :: IO (TVar [ThreadId])
+            let h =LogH { logQ = q
+                        , logFileName = logFile
+                        , logPrefix = prefix
+                        , logReplaceMap = replaceMap
+                        , logEchoFlag = echoFlag
+                        , logFileMutex = mutex
+                        , logManagers = managers
+                        }
+            atomically $ modifyTVar globalLogHandleRegistry (M.insert (B.pack logFile) h)
+            return h
+
+{-
+withLog :: String -> IO () -> IO ()
+withLog name action = do
+    appName <- getProgName
+    appDir <- getAppUserDataDirectory appName
+    createDirectoryIfMissing True appDir
+
+-}
+enableEcho lh = atomically $ writeTVar (logEchoFlag lh) True
+disableEcho lh = atomically $ writeTVar (logEchoFlag lh) False
+
+equate :: LogHandle -> B.ByteString -> B.ByteString -> IO Bool
+equate lh key@(B.uncons -> Just (k,ey)) val = do
     tid <- myThreadId
     let disallowed = ["$t","%t","%s", "%d"] 
     if k `elem` "%$" then 
         if key `notElem` disallowed then do
-            atomically $ modifyTVar globalLogReplaceMap (M.insert (tid,key) val)
+            atomically $ modifyTVar (logReplaceMap lh) (M.insert (tid,key) val)
             return True
         else do
-            log' $ "ERROR (Logging):" 
+            logRaw lh $ "ERROR (Logging):" 
                 <> B.pack (show tid) 
                 <> " Cannot change magic substitution keys: '" <> B.pack (show disallowed) 
             return False
     else do
-        log' $ "ERROR (Logging):" 
+        logRaw lh $ "ERROR (Logging):" 
             <> B.pack (show tid) 
             <> " Failed to equate '" <> key <> "' and '" <> val <> "'. Must prefix '$' or '%'."
         return False
 
-equate "" val  = do
+equate lh "" val  = do
         tid <- myThreadId
-        log' $ "ERROR (Logging):" 
+        logRaw lh $ "ERROR (Logging):" 
             <> B.pack (show tid) 
             <> " Cannot equate '" <> val <> "' to empty string."
         return False
 
-log' s = do
+logRaw lh s = do
     tid <- myThreadId
-    atomically $ writeTBMQueue globalLogQ (tid,s)
+    atomically $ writeTBMQueue (logQ lh) (tid,s)
 
-startLoggingQueue file logq shutdownTMVar = async . fix $ \loop -> (
+clearEquates lh = do
+    tid <- myThreadId
+    atomically $ modifyTVar (logReplaceMap lh) (M.filterWithKey (\(id,_) _ -> id/=tid))
+        
+appendFileWithMutex x f s = do
+    torch <- atomically $ takeTMVar x
+    B.appendFile f s
+    atomically $ putTMVar x torch
+
+stopLogging lh = async $ do 
+    tid <- myThreadId
+    atomically $ modifyTVar (logManagers lh) (filter (/=tid))
+
+startLogging lh = async $ do 
+    let file = logFileName lh
+        logq = logQ lh
+    mgrs <- atomically $ readTVar (logManagers lh)
+    tid <- myThreadId
+    atomically $ modifyTVar (logManagers lh) (tid:)
+    when (null mgrs) . fix $ \loop -> (
         whileM_ (atomically . fmap not . isClosedTBMQueue $ logq) $ do
-            done <- atomically $ tryReadTMVar shutdownTMVar
-            case done of 
-                Just _ -> atomically $ closeTBMQueue logq
-                Nothing -> do
                     whileM_ (atomically $ isEmptyTBMQueue logq) (threadDelay 2000)
                     whileM_ (atomically . fmap not $ isEmptyTBMQueue logq) $ do
                         x <- atomically $ readTBMQueue logq
+                        prefix <- atomically $ readTVar (logPrefix lh)
                         case x of
-                            Just (th,s) -> do
-                                equates <- atomically $ readTVar globalLogReplaceMap
+                            Just (th,B.append prefix -> s) -> do
+                                equates <- atomically $ readTVar (logReplaceMap lh)
                                 tid <- myThreadId
                                 
                                 let kvs :: [(B.ByteString, B.ByteString)]
                                     kvs = fmap (\((_,k),v) -> (k,v)) (filter ((==tid) . fst . fst) (M.toList equates))
                                     kvs' = fmap (\(x,y) -> (L.fromChunks [x], L.fromChunks [y])) kvs
                                     s' :: L.ByteString 
+                                    -- TODO: This is not a very efficient way to make replacements..
                                     s' = foldl'
                                             (\s (k,v) -> replace k v (B.concat $ L.toChunks s))
                                             (L.fromChunks [s])
                                             kvs
                                 let outline = B.concat $ L.toChunks s'
-                                B.appendFile file outline
-                                bEcho <- atomically $ readTVar globalEchoFlag
+                                appendFileWithMutex (logFileMutex lh) file outline
+                                bEcho <- atomically $ readTVar (logEchoFlag lh)
                                 if bEcho then B.putStrLn outline else return ()
                             _ -> return ()
-    ) `catches` [ Handler (\(e:: IOException) -> appendFile file ("ERROR (Logging): " ++ show e ++ "\n"))
-                , Handler (\(FormatError st s:: FormatError) -> do 
-                                case st of
-                                    _ -> appendFile file ("ERROR (Logging): " ++ s ++ "\n") 
-                                loop
-                          )]
+        ) `catches` [ Handler (\(e:: IOException) -> do
+                        bStdErr <- hIsOpen stderr 
+                        when bStdErr $
+                            hPutStr stderr ("ERROR (Logging): " ++ show e ++ "\n"))
+                    , Handler (\(FormatError st s:: FormatError) -> do 
+                        case st of
+                            _ -> appendFileWithMutex (logFileMutex lh) file (B.pack $ "ERROR (Logging): " ++ s ++ "\n") 
+                        loop
+                              )]
 
 data FormatError = FormatError (Maybe FormatState) String deriving (Show,Typeable)
 instance Exception FormatError
     
-startLogging logfile = startLoggingQueue logfile globalLogQ globalShutdownLogging
 
-log :: B.ByteString -> IO ()
-log s = do
+log :: LogHandle -> B.ByteString -> IO ()
+log lh s = do
     tid <- myThreadId
     let t = B.pack $ show tid
-    atomically $ modifyTVar globalLogReplaceMap (M.insert (tid,"%t") t)
-    atomically $ modifyTVar globalLogReplaceMap (M.insert (tid,"$t") t)
-    atomically $ writeTBMQueue globalLogQ (tid,s <> "\n")
+    atomically $ modifyTVar (logReplaceMap lh) (M.insert (tid,"%t") t)
+    atomically $ modifyTVar (logReplaceMap lh) (M.insert (tid,"$t") t)
+    atomically $ writeTBMQueue (logQ lh) (tid,s <> "\n")
 
 -- logf s = atomically . writeTBMQueue globalLogQ . B.pack . printf (s <> "\n")
 
@@ -161,10 +232,10 @@ mkFormatTag x =
 --    mkFormatTag = FmtInteger
 
 class LogFType t where
-    logfTags ::  Maybe FormatState -> String -> [FormatTag] -> t
+    logfTags ::  LogHandle -> Maybe FormatState -> String -> [FormatTag] -> t
 
 instance LogFType String where
-    logfTags st formatstr args = uprintf st formatstr (reverse args)
+    logfTags lh st formatstr args = uprintf st formatstr (reverse args)
 
 data FormatState = FState { threadId :: ThreadId } deriving (Show,Typeable)
 
@@ -198,48 +269,63 @@ argerror fs = errorFmt fs "Insufficient args for format string"
 errorFmt fs s= throw (FormatError fs s)
 
 instance LogFType (IO a) where
-    logfTags state formatstr args = case state of
+    logfTags lh state formatstr args = case state of
         Nothing -> do
-            log (B.pack $ uprintf Nothing formatstr (reverse args)) 
+            log lh (B.pack $ uprintf Nothing formatstr (reverse args)) 
             return undefined
         ms -> do
-            log (B.pack $ uprintf ms formatstr (reverse args)) 
+            log lh (B.pack $ uprintf ms formatstr (reverse args)) 
             return undefined
 
 instance (Typeable a, Show a, LogFType t) => LogFType (a -> t) where
-    logfTags state fmt args a = logfTags state fmt (mkFormatTag a : args)
+    logfTags lh state fmt args a = logfTags lh state fmt (mkFormatTag a : args)
 
-logf :: LogFType r => String -> r
-logf fmtstr = logfTags Nothing fmtstr []
+logf :: LogFType r => LogHandle -> String -> r
+logf lh fmtstr = logfTags lh Nothing fmtstr []
 
 
-withLog :: String -> IO () -> IO ()
-withLog name action = do
-    appName <- getProgName
-    appDir <- getAppUserDataDirectory appName
-    createDirectoryIfMissing True appDir
-    let logFile = case name of
-                    "" -> appDir </> appName ++ ".log"
-                    _ ->  appDir </> appName ++ "." ++ name ++ ".log"
-    bracket 
-            (startLogging logFile) 
+withLogH :: LogHandle -> (IO a) -> IO a
+withLogH lh action = do
+    bracket
+            (startLogging lh)
             (\aid -> do
+                stopLogging lh
                 threadDelay 10000 -- time to print any exceptions
-                atomically $ closeTBMQueue globalLogQ
+                atomically $ closeTBMQueue (logQ lh)
                 threadDelay 1000 -- give it a chance to shutdown itself
                 cancel aid       -- kill the thread
             )
             (\aid -> 
-                catch action logException
+                catch action (logException lh)
             )
-                
-        
-    where
-        waitForLog x = do
-            whileM (fmap not . atomically $ isEmptyTBMQueue globalLogQ) (threadDelay 5000)
-            atomically $ closeTBMQueue globalLogQ
-            return x
-        logException e = do
-            log (B.pack $ "ERROR: " ++ show (e::SomeException) ++ "\n")
-            throw e
 
+withLog :: String -> (LogHandle -> IO a) -> IO a
+withLog name action = do
+    lh <- newLog name
+    withLogH lh (action lh)
+
+withLogFile :: String -> (LogHandle -> IO a) -> IO a
+withLogFile name action = do
+    lh <- newLogWithFile name
+    withLogH lh (action lh)
+
+withQuickLog :: String -> ((LogHandle,B.ByteString -> IO ()) -> IO a) -> IO a
+withQuickLog name action = do
+    lh <- newLog name
+    withLogH lh (action (lh,log lh))
+
+withQuickLogEquate :: String 
+                   -> ((LogHandle,B.ByteString -> IO (),B.ByteString -> B.ByteString -> IO Bool) -> IO a) 
+                   -> IO a
+withQuickLogEquate name action = do
+    lh <- newLog name
+    withLogH lh (action (lh,log lh,equate lh))
+
+withQuickLogEquateLogF name action = do
+    lh <- newLog name
+    withLogH lh (action (lh,log lh,equate lh,logf lh))
+
+logException :: LogHandle -> SomeException -> IO a
+logException lh e = do
+    log lh (B.pack $ "ERROR: " ++ show (e::SomeException) ++ "\n")
+    throw e

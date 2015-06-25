@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE TypeFamilies #-}
 module Merv.PortServer (createTCPPortListener,createIRCPortListener) where
 
 import qualified Data.ByteString.Char8 as B
@@ -22,19 +23,16 @@ import Control.Monad.Loops
 import Merv.Multiplex (pipeTransHookMicroseconds)
 import Control.Exception
 import Control.Concurrent.Async
-import Data.Serialize
 
 import Control.Arrow (second)
-import qualified Merv.GetLine as MG
+import Codec.LineReady
 
-instance Serialize IRC.Message where
-    put = putByteString . IRC.encode
-    get = do
-        x <- MG.getLine
-        case IRC.decode x of
-            Just x -> return x
-            Nothing -> fail ("IRC PARSE ERROR:'" <> B.unpack x <> "'")
-
+instance LineReady IRC.Message where
+    type SerialError IRC.Message = String
+    toLineReady = IRC.encode
+    fromLineReady s = case IRC.decode s of
+        Just x -> Right x
+        Nothing -> Left ("IRC PARSE ERROR:'" <>  B.unpack s <> "'")
 
 createIRCPortListener :: PortNumber -> B.ByteString -> Int -> Int -> Int
                    -> TBMQueue (ThreadId,TBMQueue IRC.Message) -> TBMQueue IRC.Message -> IO ()
@@ -42,7 +40,7 @@ createIRCPortListener port name delay qsize maxconns postNewTChans outq =
   createTCPPortListener port name delay qsize maxconns postNewTChans outq ircReact
 
 
-createTCPPortListener :: Serialize a => PortNumber -> B.ByteString -> Int -> Int -> Int
+createTCPPortListener :: LineReady a => PortNumber -> B.ByteString -> Int -> Int -> Int
                    -> TBMQueue (ThreadId,TBMQueue a) -> TBMQueue a 
                    -> (Handle -> TBMQueue a -> IO ()) -> IO ()
 createTCPPortListener port name delay qsize maxconns postNewTChans outq react = 
@@ -64,7 +62,7 @@ createTCPPortListener port name delay qsize maxconns postNewTChans outq react =
         sockAcceptLoop sock name delay qsize postNewTChans outq react
         )
  
-sockAcceptLoop :: Serialize a => Socket -> B.ByteString -> Int -> Int -> TBMQueue (ThreadId,TBMQueue a) -> TBMQueue a 
+sockAcceptLoop :: LineReady a => Socket -> B.ByteString -> Int -> Int -> TBMQueue (ThreadId,TBMQueue a) -> TBMQueue a 
                        -> (Handle -> TBMQueue a -> IO ()) -> IO ()
 sockAcceptLoop listenSock name delay qsize postNewTChans outq react = 
     whileM_ (atomically $ fmap not (isClosedTBMQueue postNewTChans)) $ do
@@ -97,7 +95,7 @@ sockAcceptLoop listenSock name delay qsize postNewTChans outq react =
                 waitBoth async1 async2
             )
  
-runConn :: Serialize a => Handle -> B.ByteString -> TBMQueue a -> TBMQueue a -> Int 
+runConn :: LineReady a => Handle -> B.ByteString -> TBMQueue a -> TBMQueue a -> Int 
                        -> (Handle -> TBMQueue a -> IO ()) -> IO ()
 runConn hdl name q outq delay react = do
     --send sock (encode (Message Nothing "NOTICE" ["*", ("Hi " <> name <> "!\n")]))
@@ -114,7 +112,7 @@ runConn hdl name q outq delay react = do
             whileM_ pending  $ do
                 m <- atomically (readTBMQueue q)
                 case m of
-                    Just m -> B.hPutStrLn hdl (encode m) 
+                    Just m -> B.hPutStrLn hdl (toLineReady m) 
                     -- Nothing means the Queue is closed and empty, so dont loop
                     Nothing -> return () 
             threadDelay delay
@@ -128,13 +126,13 @@ runConn hdl name q outq delay react = do
 
 ircReact hdl outq = do
         line <- B.hGetLine hdl
-        -- debugging
+        {- debugging
         dir <- getAppUserDataDirectory "merv"
         tid <- myThreadId
         let bQuit = (B.isPrefixOf "/quit") line
         appendFile (dir </> "xdebug") 
                    (printf "%s:%s\n(bQuit=%s) %s\n" (show tid) (show line) (show bQuit) (show $ IRC.parseMessage line))
-        -- end debugging
+        -- end debugging -}
         case IRC.decode line of
             Just (IRC.msg_command -> "QUIT") -> atomically $ closeTBMQueue outq
             Just m -> atomically $ writeTBMQueue outq m
