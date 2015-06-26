@@ -2,8 +2,8 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 import Prelude hiding (log)
-import qualified Merv.Log as Log
-import Merv.Multiplex
+import qualified Data.ByteString.Char8.Log as Log
+import Control.Concurrent.STM.TBMQueue.Multiplex
 
 import System.Environment
 import Control.Exception --(throw,ArithException (..))
@@ -18,7 +18,7 @@ import Control.Concurrent
 import Control.Monad
 import Control.Monad.Loops
 
-import Merv.PortServer
+import Network.Server.Listen.TCP
 import Control.Concurrent.Async
 import Data.Monoid
 import System.IO.Temp
@@ -29,10 +29,10 @@ main = Log.withLog "" $ \lh -> do
     newchans <- atomically $ newTBMQueue 20 :: IO (TBMQueue (ThreadId, TBMQueue IRC.Message))
     outq <- atomically $ newTBMQueue 20 :: IO (TBMQueue IRC.Message)
     connections <- atomically $ newTVar M.empty :: IO (TVar (M.Map ThreadId (TBMQueue IRC.Message)))
-    log "Listening on port 4444..."
-    listenAsync <- async $ createIRCPortListener 4444 "<SERVER-NAME>" 5000 20 20 newchans outq 
-    newchanAsync <- async $ consumeQueueMicroseconds newchans 5000 (runNewClientConnection outq connections)
     broadcaster <- async $ consumeQueueMicroseconds outq 5000 (broadcast connections)
+    listenAsync <- async $ createIRCPortListener 4444 "<SERVER-NAME>" 5000 20 20 newchans outq 
+    log "Listening on port 4444..."
+    newchanAsync <- async $ consumeQueueMicroseconds newchans 5000 (runNewClientConnection outq connections)
     
     void $ waitAny [listenAsync,newchanAsync,broadcaster]
     

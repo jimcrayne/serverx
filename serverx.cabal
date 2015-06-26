@@ -22,7 +22,11 @@ build-type:          Simple
 cabal-version:       >=1.10
 
 library 
-  exposed-modules: Merv.Log, Merv.PortServer, Merv.Multiplex, Merv.GetLine, Codec.LineReady
+  exposed-modules:     Data.ByteString.Char8.Log,
+                       Network.Server.Listen.TCP,
+                       Control.Concurrent.STM.TBMQueue.Multiplex, 
+                       Codec.LineReady
+
   build-depends:       base >=4.7 && <4.8,
 
                        network >= 2.4 && < 3.0, 

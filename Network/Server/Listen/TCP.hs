@@ -2,7 +2,7 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE TypeFamilies #-}
-module Merv.PortServer (createTCPPortListener,createIRCPortListener) where
+module Network.Server.Listen.TCP (createTCPPortListener,createIRCPortListener) where
 
 import qualified Data.ByteString.Char8 as B
 import Network.Socket hiding (send)
@@ -20,7 +20,7 @@ import Text.Printf (printf)
 import System.FilePath ((</>))
 import Control.Concurrent.STM.TBMQueue
 import Control.Monad.Loops
-import Merv.Multiplex (pipeTransHookMicroseconds)
+import Control.Concurrent.STM.TBMQueue.Multiplex (pipeTransHookMicroseconds)
 import Control.Exception
 import Control.Concurrent.Async
 

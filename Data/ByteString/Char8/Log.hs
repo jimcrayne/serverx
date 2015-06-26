@@ -7,7 +7,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DoAndIfThenElse #-}
-module Merv.Log where
+module Data.ByteString.Char8.Log where
     
 import Prelude hiding (log,catch)
 import System.IO

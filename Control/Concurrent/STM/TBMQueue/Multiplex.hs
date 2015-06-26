@@ -5,7 +5,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE BangPatterns #-}
-module Merv.Multiplex where
+module Control.Concurrent.STM.TBMQueue.Multiplex where
 
 import System.IO
 import qualified Data.ByteString.Char8 as B
