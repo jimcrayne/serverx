@@ -50,8 +50,9 @@ pipeTransHook fromChan toChan translate triggerAction =
 pipeTrans fromChan toChan translate = 
     pipeTransHook fromChan toChan translate (void . return)
 
+
 pipeHook fromChan toChan triggerAction = 
-    pipeTransHook fromChan toChan id triggerAction
+    pipeTransHook fromChan toChan (\() -> Just) triggerAction
 
 pipeQueue fromChan toChan =
     pipeTransHookMicroseconds fromChan toChan 5000 (\() -> Just) (void . return) 
@@ -94,7 +95,9 @@ withQueue fromchan action = consumeQueueMicroseconds fromchan 5000 action
 consumeQueueMicroseconds q micros action = whileM_ (atomically . fmap not $ isClosedTBMQueue q) $ do
     whileM_ (atomically . fmap not $ isEmptyTBMQueue q) $ do
         x <- atomically $ readTBMQueue q
+        putStrLn ("DEBUG consumeQueueMicroseconds (" <> show (fmap fst x) <> ")")
         case x of
             Just s -> action s
             Nothing -> return ()
+        putStrLn ("DEBUG consumeQueueMicroseconds COMPLETED (" <> show (fmap fst x) <> ")")
     threadDelay micros

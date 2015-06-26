@@ -1,10 +1,12 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE TypeFamilies #-}
 module Network.Server.Listen.TCP (createTCPPortListener,createIRCPortListener) where
 
 import qualified Data.ByteString.Char8 as B
+import qualified Data.ByteString.Char8.Log as Log
 import Network.Socket hiding (send)
 import Network.Socket.ByteString
 import Data.Monoid ((<>))
@@ -90,6 +92,7 @@ sockAcceptLoop listenSock name delay qsize postNewTChans outq react =
             -- run opration on async
             (\(_,q,_,(async1,async2)) -> do
                 let tid = asyncThreadId async1
+                putStrLn ("DEBUG listenSock! Connection: " <> show tid)
                 atomically $ writeTBMQueue postNewTChans (tid,q)
                 --link2 async1 async2  -- Do I need this?
                 waitBoth async1 async2
@@ -124,8 +127,11 @@ runConn hdl name q outq delay react = do
         (whileM_ (atomically . fmap not $ isClosedTBMQueue outq) $ react hdl outq )
 
 
-ircReact hdl outq = do
-        line <- B.hGetLine hdl
+ircReact hdl outq = Log.withLog "" $ \lh -> do
+        line <- catch (B.hGetLine hdl) (\(e :: IOException) -> do
+            atomically $ closeTBMQueue outq
+            return "")
+        Log.log lh $ B.append "DEBUG ircReact <" line
         {- debugging
         dir <- getAppUserDataDirectory "merv"
         tid <- myThreadId

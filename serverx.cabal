@@ -60,6 +60,7 @@ executable serverx
   buildable:           True
   build-depends:       base >=4.7 && <4.8,
 
+                       time ==1.*,
                        network >= 2.4 && < 3.0, 
                        -- may work with other versions
 

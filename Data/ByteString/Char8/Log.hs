@@ -51,7 +51,7 @@ data LogHandle = LogH { logQ :: LogQueue
                                                  -- an active logManagers list... But I'll leave it
                                                  -- just in case someone wants to write to the file
                                                  -- from some non logManager thread.
-                      , logManagers :: TVar [ThreadId]
+                      , logManagers :: TVar Int
                       }
 
 globalLogHandleRegistry :: TVar (M.Map B.ByteString LogHandle)
@@ -85,7 +85,7 @@ newLogWithFile logFile = do
             prefix <- newTVarIO (B.pack "")
             echoFlag <- newTVarIO False
             mutex <- newTMVarIO ()
-            managers <- newTVarIO [] :: IO (TVar [ThreadId])
+            managers <- newTVarIO 0 :: IO (TVar Int)
             let dir = takeDirectory logFile
             createDirectoryIfMissing True dir
             fileExists <- doesFileExist logFile
@@ -104,6 +104,7 @@ newLogWithFile logFile = do
 
 enableEcho lh = atomically $ writeTVar (logEchoFlag lh) True
 disableEcho lh = atomically $ writeTVar (logEchoFlag lh) False
+setPrefix lh s = atomically $ writeTVar (logPrefix lh) s
 
 equate :: LogHandle -> B.ByteString -> B.ByteString -> IO Bool
 equate lh key@(B.uncons -> Just (k,ey)) val = do
@@ -140,21 +141,28 @@ clearEquates lh = do
     atomically $ modifyTVar (logReplaceMap lh) (M.filterWithKey (\(id,_) _ -> id/=tid))
         
 appendFileWithMutex x f s = do
+    --putStrLn "DEBUG $ AWAIT mutex"
     torch <- atomically $ takeTMVar x
     B.appendFile f s
+    --putStrLn "DEBUG $ Pass mutex"
     atomically $ putTMVar x torch
 
-stopLogging lh = async $ do 
-    tid <- myThreadId
-    atomically $ modifyTVar (logManagers lh) (filter (/=tid))
+stopLogging lh = do
+    mgrs <- atomically $ do
+        modifyTVar (logManagers lh) (subtract 1) 
+        readTVar (logManagers lh)
+    when (mgrs == 0) $ do
+        threadDelay 10000 -- time to print any exceptions
+        atomically $ closeTBMQueue (logQ lh)
+        threadDelay 1000 -- give it a chance to shutdown itself
 
 startLogging lh = async $ do 
     let file = logFileName lh
         logq = logQ lh
-    mgrs <- atomically $ readTVar (logManagers lh)
-    tid <- myThreadId
-    atomically $ modifyTVar (logManagers lh) (tid:)
-    when (null mgrs) . fix $ \loop -> (
+    mgrs <- atomically $ do
+        modifyTVar (logManagers lh) (+1)
+        readTVar (logManagers lh)
+    when (mgrs == 1) . fix $ \loop -> (do
         whileM_ (atomically . fmap not . isClosedTBMQueue $ logq) $ do
                     whileM_ (atomically $ isEmptyTBMQueue logq) (threadDelay 2000)
                     whileM_ (atomically . fmap not $ isEmptyTBMQueue logq) $ do
@@ -163,10 +171,9 @@ startLogging lh = async $ do
                         case x of
                             Just (th,B.append prefix -> s) -> do
                                 equates <- atomically $ readTVar (logReplaceMap lh)
-                                tid <- myThreadId
                                 
                                 let kvs :: [(B.ByteString, B.ByteString)]
-                                    kvs = fmap (\((_,k),v) -> (k,v)) (filter ((==tid) . fst . fst) (M.toList equates))
+                                    kvs = fmap (\((_,k),v) -> (k,v)) (filter ((==th) . fst . fst) (M.toList equates))
                                     kvs' = fmap (\(x,y) -> (L.fromChunks [x], L.fromChunks [y])) kvs
                                     s' :: L.ByteString 
                                     -- TODO: This is not a very efficient way to make replacements..
@@ -185,7 +192,10 @@ startLogging lh = async $ do
                             hPutStr stderr ("ERROR (Logging): " ++ show e ++ "\n"))
                     , Handler (\(FormatError st s:: FormatError) -> do 
                         case st of
-                            _ -> appendFileWithMutex (logFileMutex lh) file (B.pack $ "ERROR (Logging): " ++ s ++ "\n") 
+                            _ -> 
+                                appendFileWithMutex (logFileMutex lh) 
+                                                    file 
+                                                    (B.pack $ "ERRORk(Logging): " ++ s ++ "\n") 
                         loop
                               )]
 
@@ -287,13 +297,9 @@ withLogH lh action = do
             (startLogging lh)
             (\aid -> do
                 stopLogging lh
-                threadDelay 10000 -- time to print any exceptions
-                atomically $ closeTBMQueue (logQ lh)
-                threadDelay 1000 -- give it a chance to shutdown itself
                 cancel aid       -- kill the thread
             )
-            (\aid -> 
-                catch action (logException lh)
+            (\aid -> catch action (logException lh)
             )
 
 withLog :: String -> (LogHandle -> IO a) -> IO a
@@ -324,6 +330,7 @@ withQuickLogEquateLogF name action = do
 
 logException :: LogHandle -> SomeException -> IO a
 logException lh e = do
+    hPutStrLn stderr ("ERROR LogException " ++ show e)
     log lh (B.pack $ "ERROR: " ++ show (e::SomeException) ++ "\n")
     throw e
 
