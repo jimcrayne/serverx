@@ -22,7 +22,7 @@ build-type:          Simple
 cabal-version:       >=1.10
 
 library 
-  exposed-modules:     Data.ByteString.Char8.Log,
+  exposed-modules:     System.IO.Log,
                        Network.Server.Listen.TCP,
                        Control.Concurrent.STM.TBMQueue.Multiplex, 
                        Codec.LineReady

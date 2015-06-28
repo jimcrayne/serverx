@@ -1,6 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 -- Imports from elsewhere
 import Prelude hiding (log)
@@ -19,15 +21,24 @@ import Data.Monoid
 import System.IO.Temp
 
 -- Imports from this library/package...
-import qualified Data.ByteString.Char8.Log as Log
+import qualified System.IO.Log as Log
 import Control.Concurrent.STM.TBMQueue.Multiplex
 import Network.Server.Listen.TCP
 import Network.IRC.ClientState
+import Codec.LineReady
 
+instance LineReady IRC.Message where
+    type SerialError IRC.Message = String
+    toLineReady = IRC.encode
+    fromLineReady s = case IRC.decode s of
+        Just x -> Right x
+        Nothing -> Left ("IRC PARSE ERROR:'" <>  B.unpack s <> "'")
 
 -- Type to use as the parameter to ClientState
 -- it is stored in the connectionInfo field
 type ConnectionInfo = (ThreadId, TBMQueue IRC.Message)
+instance Show (TBMQueue IRC.Message) where
+    show x = "<TBMQueue>"
 
 -- | clientIsAccepting
 --
@@ -52,9 +63,9 @@ type ClientId = ThreadId
 --
 -- Program entry.
 main = Log.withLog "" $ \lh -> do
-    let log = Log.log lh . B.pack
     Log.enableEcho lh
-    Log.setPrefix lh (B.pack "LOG:")
+    Log.setPrefix lh (B.pack "[%tid]:")
+    let log = Log.log lh . B.pack
 
     -- Initialize Thread-Save Data
     newchans <- atomically $ newTBMQueue 20 :: IO (TBMQueue (ThreadId, TBMQueue IRC.Message))
@@ -69,10 +80,12 @@ main = Log.withLog "" $ \lh -> do
     -- recieve messages from children in coutq and then log them before sending them back out
     listenAsync <- async $ do 
         log "Listening on port 4444..."
-        createIRCPortListener 4444 "<SERVER-NAME>" 5000 20 20 newchans coutq 
-    handleIncoming <- async . pipeHook coutq outq $ \msg -> do
+        createTCPPortListener 4444 "<SERVER-NAME>" 5000 20 20 
+                              return newchans coutq B.hGetLine lineToIRC (ircReact connections)
+
+    {- handleIncoming <- async . pipeHook coutq outq $ \msg -> do
         Log.log lh . B.pack . show $ msg
-        Log.log lh . B.append "< " . IRC.encode $ msg
+        Log.log lh . B.append "< " . IRC.encode $ msg -}
 
     putStrLn "DEBUG : kick off consumeQueueMicroseconds async!"
     newchanAsync <- async $ consumeQueueMicroseconds newchans 5000 (runNewClientConnection outq connections)
@@ -125,3 +138,35 @@ broadcast connections msg =  Log.withLog "" $ \lh -> do
         Log.log lh (" > (All conns) " <> IRC.encode msg)
         atomically $ writeTBMQueue q msg
     
+lineToIRC line = 
+        case IRC.decode line of
+            Just m -> m
+            Nothing | "/q" `B.isPrefixOf` line -> IRC.quit (Just line)
+            Nothing -> IRC.Message Nothing "PARSE_ERROR" [line]
+
+ircReact cons clientId msg = Log.withQuickLogEquate "" $ \(lh,log,equate) -> do
+  client <- fmap lookupState . atomically $ readTVar cons
+  Log.clearEquates lh
+  equate "%cli" (B.pack $ show clientId)
+  equate "%msg" (B.pack $ show msg)
+  equate "%nick" (B.pack $ show (nick client))
+  case registerState client of
+    UnRegistered awaiting ip -> log "%nick UNREGISTERED> %msg"
+    Registered user prefix -> handleMessage (client,log) msg
+  log (B.pack $ show client)
+  -- Log.clearEquates lh -- TODO: This should be fine, but it isn't, 
+                         -- probably because it is retroactively affecting items still on the log queue
+    where 
+        lookupState clients =
+            case M.lookup clientId clients of
+                Just cs -> cs
+                _ -> clientState0 -- ignored, but this will type check
+
+        updateState f = atomically $ modifyTVar cons (M.update f clientId) 
+        setState :: ClientState ConnectionInfo -> IO ()
+        setState cs = updateState (const (Just cs))
+
+        handleMessage (client,log) msg = 
+          case msg of
+            _ -> do
+                    log "%nick> %msg"
