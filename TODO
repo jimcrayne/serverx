@@ -1,6 +1,10 @@
 
+* add DateFormatCodes to disallowed list in Log
 * load MOTD from config
 * get ip from socket and pass it on to newChans queue
 * Ensure nick is valid
 * Ensure nick is not used
 * PRIVMSG command
+* FIX BUG where server seems to stop working after some time
+* Implement reasonable time out for registration
+* Limit number of bytes read from messages, according to RFC
