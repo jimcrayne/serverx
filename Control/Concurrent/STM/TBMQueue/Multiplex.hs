@@ -95,9 +95,7 @@ withQueue fromchan action = consumeQueueMicroseconds fromchan 5000 action
 consumeQueueMicroseconds q micros action = whileM_ (atomically . fmap not $ isClosedTBMQueue q) $ do
     whileM_ (atomically . fmap not $ isEmptyTBMQueue q) $ do
         x <- atomically $ readTBMQueue q
-        putStrLn ("DEBUG consumeQueueMicroseconds (" <> show (fmap fst x) <> ")")
         case x of
             Just s -> action s
             Nothing -> return ()
-        putStrLn ("DEBUG consumeQueueMicroseconds COMPLETED (" <> show (fmap fst x) <> ")")
     threadDelay micros

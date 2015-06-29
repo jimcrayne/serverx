@@ -19,6 +19,9 @@ import Control.Monad.Loops
 import Control.Concurrent.Async
 import Data.Monoid
 import System.IO.Temp
+import Network.BSD
+import Data.List
+import Data.DateTime
 
 -- Imports from this library/package...
 import qualified System.IO.Log as Log
@@ -26,6 +29,10 @@ import Control.Concurrent.STM.TBMQueue.Multiplex
 import Network.Server.Listen.TCP
 import Network.IRC.ClientState
 import Codec.LineReady
+import IRCError
+import IRCReply
+import Data.Version
+import Paths_serverx (version)
 
 instance LineReady IRC.Message where
     type SerialError IRC.Message = String
@@ -59,6 +66,8 @@ clientQ _ = error "NO CLIENT QUEUE!"
 
 type ClientId = ThreadId
 
+data ServerState = ServerState { hostname :: B.ByteString
+                               , serverStartDate :: DateTime}
 -- | main
 --
 -- Program entry.
@@ -66,7 +75,9 @@ main = Log.withLog "" $ \lh -> do
     Log.enableEcho lh
     Log.setPrefix lh (B.pack "[%tid]:")
     let log = Log.log lh . B.pack
-
+    starttime <- getCurrentTime
+    hostname <- fmap B.pack getHostName
+    let serverstate= ServerState hostname starttime
     -- Initialize Thread-Save Data
     newchans <- atomically $ newTBMQueue 20 :: IO (TBMQueue (ThreadId, TBMQueue IRC.Message))
     coutq <- atomically $ newTBMQueue 20 :: IO (TBMQueue IRC.Message)
@@ -81,13 +92,12 @@ main = Log.withLog "" $ \lh -> do
     listenAsync <- async $ do 
         log "Listening on port 4444..."
         createTCPPortListener 4444 "<SERVER-NAME>" 5000 20 20 
-                              return newchans coutq B.hGetLine lineToIRC (ircReact connections)
+                              return newchans coutq B.hGetLine lineToIRC (ircReact serverstate connections)
 
     {- handleIncoming <- async . pipeHook coutq outq $ \msg -> do
         Log.log lh . B.pack . show $ msg
         Log.log lh . B.append "< " . IRC.encode $ msg -}
 
-    putStrLn "DEBUG : kick off consumeQueueMicroseconds async!"
     newchanAsync <- async $ consumeQueueMicroseconds newchans 5000 (runNewClientConnection outq connections)
 
     
@@ -117,7 +127,7 @@ runNewClientConnection outq connmap (tid,chan) = Log.withLog "" $ \lh -> do
     let name = B.pack (filter (/=' ') $ show tid)
         welcomeMessage = ("Welcome!! New Connection: You are " <> name)
     log ("-> (" <> name <> ") " <> welcomeMessage)
-    atomically $ writeTBMQueue chan (IRC.privmsg "" welcomeMessage)
+    -- atomically $ writeTBMQueue chan (IRC.notify name welcomeMessage)
     let l = M.toList mp
     forM_ l $ \(i,clientQ -> c) -> do
         let entrance = IRC.privmsg "" ("* " <> name <> " enters.")
@@ -144,18 +154,121 @@ lineToIRC line =
             Nothing | "/q" `B.isPrefixOf` line -> IRC.quit (Just line)
             Nothing -> IRC.Message Nothing "PARSE_ERROR" [line]
 
-ircReact cons clientId msg = Log.withQuickLogEquate "" $ \(lh,log,equate) -> do
+msg_command = IRC.msg_command
+msg_params = IRC.msg_params
+msg_prefix = IRC.msg_prefix
+
+ircReact serv@(ServerState hostname datetime) cons clientId msg = Log.withQuickLogEquate "" $ \(lh,log,equate) -> do
   client <- fmap lookupState . atomically $ readTVar cons
-  Log.clearEquates lh
+  let Just (_,replyq) = connectionInfo client
+  let reply cmd params = atomically $ writeTBMQueue replyq (IRC.Message { IRC.msg_prefix=Just (IRC.Server hostname)
+                                                                    , IRC.msg_command=cmd
+                                                                    , IRC.msg_params=params
+                                                                    })
   equate "%cli" (B.pack $ show clientId)
   equate "%msg" (B.pack $ show msg)
-  equate "%nick" (B.pack $ show (nick client))
+  equate "%nick" (getnick client)
   case registerState client of
-    UnRegistered awaiting ip -> log "%nick UNREGISTERED> %msg"
-    Registered user prefix -> handleMessage (client,log) msg
-  log (B.pack $ show client)
-  -- Log.clearEquates lh -- TODO: This should be fine, but it isn't, 
-                         -- probably because it is retroactively affecting items still on the log queue
+    UnRegistered awaiting ip -> do
+        log "%nick UNREGISTERED> %msg"
+        case (msg_command msg,msg_params msg) of
+            ("QUIT", msg ) -> do
+                log "%nick: %msg"
+                atomically $ closeTBMQueue replyq
+            ("NICK", [newnick]) -> setState client {nick = Nick newnick}
+
+            ("USER", [user,modereq,servunused,realname]) | not (null awaiting) -> do
+                let prefix = getnick client <> "!" <> user <> "@" <> hostname
+                    awaiting0 = filter ((/=USER).expectedCommand) awaiting
+                if null awaiting0 then do
+                    setState client {registerState = Registered user prefix realname ip}
+                    sendWelcome reply serv user prefix realname ip hostname
+                else
+                    setState client {registerState = UseredButWaiting awaiting0 user prefix realname ip}
+
+            ("USER", [user,modereq,servunused,realname]) | null awaiting -> do
+                let prefix = getnick client <> "!" <> user <> "@" <> hostname
+                setState client {registerState = Registered user prefix realname ip}
+                sendWelcome reply serv user prefix realname ip hostname
+
+
+            ("CAP",["LS"]) -> do
+                let r0 = registerState client
+                    a1 = union [Expect (-1) (-1) CAP_END] awaiting
+                    r1 = r0 { awaitingForRegistration = a1}
+                setState client {registerState = r1 }
+                reply "CAP" ["*","LS",""]
+
+            ("CAP",["END"]) | CAP_END `elem` map expectedCommand awaiting 
+                                        -> let r0 = registerState client
+                                               a1 = filter ((/=CAP_END) . expectedCommand) awaiting
+                                               r1 = r0 { awaitingForRegistration = a1}
+                                               in setState client {registerState = r1 }
+            ("CAP",_ ) -> log "Unimplemented command: %msg"
+
+            _ | not (null $ awaitingForRegistration (registerState client)) -> 
+                reply err_NOTREGISTERED ["You have not registered"]
+
+    UseredButWaiting awaiting user prefix realname ip -> do
+        log "%nick USERedButWaiting> %msg"
+        case (msg_command msg,msg_params msg) of
+            ("QUIT", msg ) -> do
+                log "%nick: %msg"
+                atomically $ closeTBMQueue replyq
+            ("NICK", [newnick]) -> do
+                let r=registerState client
+                setState client {nick = Nick newnick, registerState = r {prefix=updateprefix newnick prefix} }
+
+            ("USER", [user,modereq,servunused,realname]) | not (null awaiting) -> do
+                let prefix = getnick client <> "!" <> user <> "@" <> hostname
+                    awaiting0 = filter ((/=USER).expectedCommand) awaiting
+                if null awaiting0 then do
+                    setState client {registerState = Registered user prefix realname ip}
+                    sendWelcome reply serv user prefix realname ip hostname
+                else
+                    setState client {registerState = UseredButWaiting awaiting0 user prefix realname ip}
+
+            ("USER", [user,modereq,servunused,realname]) | null awaiting -> do
+                let prefix = getnick client <> "!" <> user <> "@" <> hostname
+                setState client {registerState = Registered user prefix realname ip}
+                sendWelcome reply serv user prefix realname ip hostname
+
+            ("CAP",["LS"]) -> do
+                let r0 = registerState client
+                    a1 = union [Expect (-1) (-1) CAP_END] awaiting
+                    r1 = r0 { awaitingForRegistration = a1}
+                setState client {registerState = r1 }
+                reply "CAP" ["*","LS",""]
+
+            ("CAP",["END"]) | CAP_END `elem` map expectedCommand awaiting -> do
+                let r0 = registerState client
+                    a1 = filter ((/=CAP_END) . expectedCommand) awaiting
+                    r1 = r0 { awaitingForRegistration = a1}
+                if (null a1) then do
+                     setState client {registerState = Registered user prefix realname ip}
+                     sendWelcome reply serv user prefix realname ip hostname
+                else setState client {registerState = r1 }
+            ("CAP",_ ) -> log "Unimplemented command: %msg"
+
+            _ | not (null $ awaitingForRegistration (registerState client)) -> 
+                reply err_NOTREGISTERED ["You have not registered"]
+
+    Registered user prefix realname ip -> do
+        equate "%user" user
+        equate "%prefix" prefix
+        case (msg_command msg, msg_params msg) of
+            ("QUIT", msg ) -> do
+                log "%nick: %msg"
+                atomically $ closeTBMQueue replyq
+            ("NICK", [newnick]) -> do
+                let r=registerState client
+                setState client {nick = Nick newnick, registerState = r {prefix=updateprefix newnick prefix} }
+            (cmd,_) -> do
+                    log "%nick> %msg"
+                    reply err_UNKNOWNCOMMAND ["nick", cmd <> " command is not implemented."]
+  clients <- atomically $ readTVar cons
+  log (B.pack $ show (lookupState clients))
+  Log.clearEquates lh 
     where 
         lookupState clients =
             case M.lookup clientId clients of
@@ -165,8 +278,24 @@ ircReact cons clientId msg = Log.withQuickLogEquate "" $ \(lh,log,equate) -> do
         updateState f = atomically $ modifyTVar cons (M.update f clientId) 
         setState :: ClientState ConnectionInfo -> IO ()
         setState cs = updateState (const (Just cs))
+        getnick cs = case nick cs of
+            NoneOrDefaultNick s -> s
+            Nick s -> s
 
-        handleMessage (client,log) msg = 
-          case msg of
-            _ -> do
-                    log "%nick> %msg"
+        updateprefix nick prefix = nick <> B.dropWhile (/='!') prefix
+        sendWelcome reply0 serv user prefix realname ip hostname = do
+           let reply cmd params= reply0 cmd (nick:params)
+               nick = B.takeWhile (/='!') prefix
+               vstr = B.pack (showVersion version)
+               datestr = B.pack $ 
+                            formatDateTime "This server was created %a %Y-%m-%d at %H:%M:%S %Z" (serverStartDate serv)
+           progname <- fmap B.pack getProgName
+           let progverstr = progname <> "-" <> vstr
+           reply "001" {- RPL_WELCOME -}
+                 [("Welcome to the Internet Relay Network " <> prefix)]
+           reply "002" {- RPL_YOURHOST -}
+                 [("Your host is " <> hostname <> ", running version " <> progverstr)]
+           reply "003" {- RPL_CREATED -}
+                 [datestr] 
+           reply "004" {- RPL_MYINFO -}
+                 [progname <> " " <> vstr <> " " <> {-available user modes>-} " "  {- available channel modes -} ]

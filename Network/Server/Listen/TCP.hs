@@ -94,7 +94,6 @@ sockAcceptLoop listenSock name delay qsize newClientId postNewTChans outq getLin
             -- run opration on async
             (\(_,q,_,(async1,async2),cid) -> do
                 let tid = asyncThreadId async1
-                putStrLn ("DEBUG listenSock! Connection: " <> show tid)
                 atomically $ writeTBMQueue postNewTChans (cid,q)
                 --link2 async1 async2  -- Do I need this?
                 waitBoth async1 async2

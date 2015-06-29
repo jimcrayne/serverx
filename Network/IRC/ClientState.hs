@@ -7,19 +7,30 @@ import qualified Data.ByteString.Char8 as B
 data AwaitCommand = USER
                   | CAP_END
                   | NICK
-                  | PONG deriving Show
+                  | PONG deriving (Show,Eq)
                   -- NumericCmd Int
 
-data RegisterState = UnRegistered { awaitingForRegistration :: [Expecting] , ipOrDomainName :: B.ByteString }
-                   | Registered { username :: B.ByteString , prefix :: B.ByteString } deriving Show
+data RegisterState = UnRegistered { awaitingForRegistration :: [Expecting] 
+                                  , ipOrDomainName :: B.ByteString 
+                                  }
+                   | UseredButWaiting { awaitingForRegistration :: [Expecting]
+                                      , username :: B.ByteString
+                                      , prefix :: B.ByteString
+                                      , realname :: B.ByteString
+                                      , ipOrDomainName :: B.ByteString 
+                                      } 
+                   | Registered { username :: B.ByteString 
+                                , prefix :: B.ByteString
+                                , realname :: B.ByteString 
+                                , ipOrDomainName :: B.ByteString} deriving Show
 
 data Nick = NoneOrDefaultNick B.ByteString
-          | Nick B.ByteString deriving Show
+          | Nick B.ByteString deriving (Show,Eq)
 
 data Expecting = Expect { expectedSince :: DiffTime
                         , timeout :: DiffTime
                         , expectedCommand :: AwaitCommand
-                        } deriving Show
+                        } deriving (Show,Eq)
 
 data ClientState a = ClientState { registerState :: RegisterState
                                  , nick :: Nick

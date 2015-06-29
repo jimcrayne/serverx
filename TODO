@@ -1,5 +1,5 @@
 
-
 * get ip from socket and pass it on to newChans queue
-* CAP & USER commands, registration
-* Fix Log Bug, clearEquates still seems to have retroactive affects on items in queue.
+* Ensure nick is valid
+* Ensure nick is not used
+* PRIVMSG command

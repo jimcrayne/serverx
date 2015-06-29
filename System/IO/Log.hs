@@ -238,7 +238,9 @@ startLogging lh = async $ do
                                     modifyTVar (logReplaceMap lh) (M.insert (th,"$t") (B.pack . show $ th)) -}
                                 let equates = M.mapKeys (\(_,k) -> k) . M.filterWithKey (\(t,k) v -> t==th) $ rmap
                                 let kvs :: [(B.ByteString, B.ByteString)]
-                                    kvs = M.toList equates ++ [("%tid",B.pack . show $ th),("$tid",B.pack . show $ th)]
+                                    kvs = M.toList equates 
+                                            ++ [("%tid",B.pack . drop 9 . show $ th)
+                                               ,("$tid",B.pack . drop 9 . show $ th)]
                                     s' :: L.ByteString 
                                     -- TODO: This is not a very efficient way to make replacements..
                                     s' = foldl'
