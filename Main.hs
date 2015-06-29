@@ -67,7 +67,8 @@ clientQ _ = error "NO CLIENT QUEUE!"
 type ClientId = ThreadId
 
 data ServerState = ServerState { hostname :: B.ByteString
-                               , serverStartDate :: DateTime}
+                               , serverStartDate :: DateTime
+                               , motd :: [B.ByteString]}
 -- | main
 --
 -- Program entry.
@@ -77,7 +78,9 @@ main = Log.withLog "" $ \lh -> do
     let log = Log.log lh . B.pack
     starttime <- getCurrentTime
     hostname <- fmap B.pack getHostName
-    let serverstate= ServerState hostname starttime
+    -- TODO: load motd from config file.
+    let motd = []
+    let serverstate= ServerState hostname starttime motd
     -- Initialize Thread-Save Data
     newchans <- atomically $ newTBMQueue 20 :: IO (TBMQueue (ThreadId, TBMQueue IRC.Message))
     coutq <- atomically $ newTBMQueue 20 :: IO (TBMQueue IRC.Message)
@@ -158,7 +161,7 @@ msg_command = IRC.msg_command
 msg_params = IRC.msg_params
 msg_prefix = IRC.msg_prefix
 
-ircReact serv@(ServerState hostname datetime) cons clientId msg = Log.withQuickLogEquate "" $ \(lh,log,equate) -> do
+ircReact serv@(ServerState hostname datetime motd0) cons clientId msg = Log.withQuickLogEquate "" $ \(lh,log,equate) -> do
   client <- fmap lookupState . atomically $ readTVar cons
   let Just (_,replyq) = connectionInfo client
   let reply cmd params = atomically $ writeTBMQueue replyq (IRC.Message { IRC.msg_prefix=Just (IRC.Server hostname)
@@ -256,6 +259,14 @@ ircReact serv@(ServerState hostname datetime) cons clientId msg = Log.withQuickL
     Registered user prefix realname ip -> do
         equate "%user" user
         equate "%prefix" prefix
+        let nick = B.takeWhile (/='!') prefix
+        let feedback cmd params = atomically $ writeTBMQueue replyq (IRC.Message 
+                        { IRC.msg_prefix=Just (IRC.NickName nick 
+                                                            (Just user) 
+                                                            (Just (B.drop 1 . B.dropWhile (/='@') $ prefix)))
+                        , IRC.msg_command=cmd
+                        , IRC.msg_params=params
+                        })
         case (msg_command msg, msg_params msg) of
             ("QUIT", msg ) -> do
                 log "%nick: %msg"
@@ -263,9 +274,20 @@ ircReact serv@(ServerState hostname datetime) cons clientId msg = Log.withQuickL
             ("NICK", [newnick]) -> do
                 let r=registerState client
                 setState client {nick = Nick newnick, registerState = r {prefix=updateprefix newnick prefix} }
+                feedback "NICK" [newnick]
+            ("CAP",["LS"]) -> do
+                reply "CAP" [nick,"LS",""]
+            ("MOTD",[]) -> do
+                postMotd reply nick serv hostname
+            ("MOTD",[s]) | s == hostname -> do -- TODO: RFC says Support Wildcards...
+                postMotd reply nick serv hostname
+            ("MOTD",_) -> do -- TODO: RFC says Support Wildcards...
+                    reply err_UNKNOWNCOMMAND [nick, "MOTD parameters not fully supported. No Wildcards. No remote servers."]
+            ("PING", [s]) -> do
+                feedback "PONG" [s]
             (cmd,_) -> do
                     log "%nick> %msg"
-                    reply err_UNKNOWNCOMMAND ["nick", cmd <> " command is not implemented."]
+                    reply err_UNKNOWNCOMMAND [nick, cmd <> " command is not implemented."]
   clients <- atomically $ readTVar cons
   log (B.pack $ show (lookupState clients))
   Log.clearEquates lh 
@@ -299,3 +321,11 @@ ircReact serv@(ServerState hostname datetime) cons clientId msg = Log.withQuickL
                  [datestr] 
            reply "004" {- RPL_MYINFO -}
                  [progname <> " " <> vstr <> " " <> {-available user modes>-} " "  {- available channel modes -} ]
+           postMotd reply0 nick serv hostname
+
+        postMotd reply0 nick serv hostname = do
+            let reply cmd params = reply0 cmd (nick:params)
+            reply rpl_MOTDSTART [hostname <> " Message of the Day -"]
+            forM_ (motd serv) $ \line -> reply rpl_MOTD [line]
+            reply rpl_ENDOFMOTD ["End of /MOTD command."]
+           

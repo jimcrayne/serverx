@@ -1,4 +1,5 @@
 
+* load MOTD from config
 * get ip from socket and pass it on to newChans queue
 * Ensure nick is valid
 * Ensure nick is not used
