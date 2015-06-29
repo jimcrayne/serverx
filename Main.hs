@@ -283,6 +283,10 @@ ircReact serv@(ServerState hostname datetime motd0) cons clientId msg = Log.with
                 postMotd reply nick serv hostname
             ("MOTD",_) -> do -- TODO: RFC says Support Wildcards...
                     reply err_UNKNOWNCOMMAND [nick, "MOTD parameters not fully supported. No Wildcards. No remote servers."]
+            ("PARSE_ERROR",xs) -> do 
+                    -- TODO: perhaps we should just upcase the command before parsing..
+                    reply err_UNKNOWNCOMMAND [nick, 
+                            "PARSE ERROR: " <> (B.pack . show $ xs) <> " (Did you use capital letters?)"]
             ("PING", [s]) -> do
                 feedback "PONG" [s]
             (cmd,_) -> do
