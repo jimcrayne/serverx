@@ -257,6 +257,7 @@ ircReact serv@(ServerState hostname datetime motd0) cons clientId msg = Log.with
                 reply err_NOTREGISTERED ["You have not registered"]
 
     Registered user prefix realname ip -> do
+        log "%nick> %msg"
         equate "%user" user
         equate "%prefix" prefix
         let nick = B.takeWhile (/='!') prefix
@@ -269,7 +270,6 @@ ircReact serv@(ServerState hostname datetime motd0) cons clientId msg = Log.with
                         })
         case (msg_command msg, msg_params msg) of
             ("QUIT", msg ) -> do
-                log "%nick: %msg"
                 atomically $ closeTBMQueue replyq
             ("NICK", [newnick]) -> do
                 let r=registerState client
